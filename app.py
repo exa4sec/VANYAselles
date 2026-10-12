@@ -1,378 +1,390 @@
 
 import os
 import json
-import re
-import sqlite3
-from datetime import datetime, timezone
-from pathlib import Path
-from urllib.parse import quote
-
-import feedparser
+import streamlit as st
 import pandas as pd
-import requests
 
-DB_PATH = Path(os.getenv("VANYA_DB_PATH", "vanya.db"))
-
-PLATFORMS = [
-    "TikTok",
-    "Instagram Reels",
-    "YouTube Shorts",
-    "YouTube Long-form",
-    "Instagram Carousel",
-]
-
-TREND_URL = (
-    "https://trends.google.com/trending/rss?geo=ID"
+from engine import (
+    PLATFORMS,
+    analyze_trends,
+    fetch_trends,
+    fetch_news,
+    generate_draft,
+    save_trends,
+    log_performance,
+    get_performance,
+    get_trend_history,
 )
 
-NEWS_URL = (
-    "https://news.google.com/rss/search?"
-    "q={query}&hl=id&gl=ID&ceid=ID:id"
+st.set_page_config(
+    page_title="Vanya Content Intelligence",
+    page_icon="🧠",
+    layout="wide",
 )
 
+st.title("🧠 Vanya Content Intelligence")
+st.caption(
+    "Trend research • AI content studio • Monetization analytics"
+)
 
-def timestamp():
-    return datetime.now(timezone.utc).isoformat()
-
-
-def init_db():
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-
-    with sqlite3.connect(DB_PATH) as con:
-        con.execute("""
-            CREATE TABLE IF NOT EXISTS trend_history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                captured_at TEXT,
-                topic TEXT,
-                score REAL,
-                traffic TEXT
-            )
-        """)
-
-        con.execute("""
-            CREATE TABLE IF NOT EXISTS performance (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                recorded_at TEXT,
-                topic TEXT,
-                platform TEXT,
-                views INTEGER DEFAULT 0,
-                likes INTEGER DEFAULT 0,
-                comments INTEGER DEFAULT 0,
-                shares INTEGER DEFAULT 0,
-                followers INTEGER DEFAULT 0,
-                revenue REAL DEFAULT 0,
-                post_url TEXT DEFAULT ''
-            )
-        """)
-        con.commit()
-
-
-def parse_traffic(value):
-    if not value:
-        return 0
-
-    match = re.search(
-        r"([\d,.]+)\s*([KMB]?)",
-        str(value).upper().replace(",", "")
-    )
-
-    if not match:
-        return 0
-
-    number = float(match.group(1))
-    multiplier = {
-        "": 1,
-        "K": 1_000,
-        "M": 1_000_000,
-        "B": 1_000_000_000,
-    }[match.group(2)]
-
-    return int(number * multiplier)
-
-
-def fetch_trends(limit=25):
-    response = requests.get(
-        TREND_URL,
-        timeout=20,
-        headers={"User-Agent": "Mozilla/5.0"},
-    )
-    response.raise_for_status()
-
-    feed = feedparser.parse(response.content)
-    results = []
-
-    for entry in feed.entries[:limit]:
-        topic = entry.get("title", "").strip()
-
-        if not topic:
-            continue
-
-        traffic = entry.get("ht_approx_traffic", "")
-
-        # Metadata berita dari Google Trends, jika tersedia.
-        news_titles = []
-        news_items = entry.get("ht_news_item", [])
-
-        if isinstance(news_items, dict):
-            news_items = [news_items]
-
-        for item in news_items:
-            if isinstance(item, dict):
-                title = item.get("ht_news_item_title", "")
-                if title:
-                    news_titles.append(title)
-
-        results.append({
-            "topic": topic,
-            "traffic": traffic,
-            "traffic_estimate": parse_traffic(traffic),
-            "news_count": len(news_titles),
-            "news_titles": news_titles,
-            "link": entry.get("link", ""),
-            "published": entry.get("published", ""),
-        })
-
-    if not results:
-        raise RuntimeError(
-            "Feed tren kosong. Coba lagi atau periksa sumber RSS."
-        )
-
-    return results
-
-
-def fetch_news(topic, limit=5):
-    url = NEWS_URL.format(query=quote(topic))
-
+# Streamlit Cloud secrets, dengan fallback ke environment variables.
+def get_config(name, default=""):
     try:
-        response = requests.get(
-            url,
-            timeout=15,
-            headers={"User-Agent": "Mozilla/5.0"},
-        )
-        response.raise_for_status()
-        feed = feedparser.parse(response.content)
-    except requests.RequestException:
-        return []
-
-    return [
-        {
-            "title": item.get("title", ""),
-            "link": item.get("link", ""),
-            "published": item.get("published", ""),
-        }
-        for item in feed.entries[:limit]
-    ]
+        value = st.secrets.get(name, default)
+        if value:
+            return str(value)
+    except Exception:
+        pass
+    return os.getenv(name, default)
 
 
-def analyze_trends(trends):
-    df = pd.DataFrame(trends)
+api_key = get_config("OPENAI_API_KEY")
+model = get_config("OPENAI_MODEL", "gpt-4.1-mini")
 
-    if df.empty:
-        return df
+if "trends" not in st.session_state:
+    st.session_state.trends = None
 
-    df["traffic_estimate"] = pd.to_numeric(
-        df["traffic_estimate"], errors="coerce"
-    ).fillna(0)
+if "drafts" not in st.session_state:
+    st.session_state.drafts = []
 
-    df["news_count"] = pd.to_numeric(
-        df["news_count"], errors="coerce"
-    ).fillna(0)
+tab_trends, tab_studio, tab_analytics = st.tabs([
+    "📡 Trend Hunter",
+    "✍️ AI Content Studio",
+    "📊 Analytics",
+])
 
-    # Ranking relatif terhadap hasil pencarian saat ini.
-    df["traffic_score"] = (
-        df["traffic_estimate"].rank(pct=True) * 100
-    )
+# =====================================
+# TAB 1: TREND HUNTER
+# =====================================
+with tab_trends:
+    st.subheader("Cari peluang konten")
 
-    df["coverage_score"] = (
-        df["news_count"].rank(pct=True) * 100
-    )
+    col1, col2 = st.columns([2, 1])
 
-    commercial_words = [
-        "harga", "review", "terbaik", "rekomendasi",
-        "ai", "aplikasi", "bisnis", "usaha",
-        "belajar", "tutorial", "produk", "laptop",
-        "ponsel", "karier", "kerja",
-    ]
-
-    def commercial_score(topic):
-        topic = str(topic).lower()
-        return (
-            100
-            if any(word in topic for word in commercial_words)
-            else 35
+    with col1:
+        limit = st.slider(
+            "Jumlah topik tren",
+            min_value=5,
+            max_value=50,
+            value=25,
         )
 
-    df["commercial_score"] = df["topic"].apply(
-        commercial_score
-    )
-
-    df["opportunity_score"] = (
-        df["traffic_score"] * 0.45
-        + df["coverage_score"] * 0.30
-        + df["commercial_score"] * 0.25
-    ).round(1)
-
-    return df.sort_values(
-        "opportunity_score", ascending=False
-    ).reset_index(drop=True)
-
-
-def save_trends(df):
-    init_db()
-
-    with sqlite3.connect(DB_PATH) as con:
-        for _, row in df.iterrows():
-            con.execute("""
-                INSERT INTO trend_history
-                (captured_at, topic, score, traffic)
-                VALUES (?, ?, ?, ?)
-            """, (
-                timestamp(),
-                str(row["topic"]),
-                float(row["opportunity_score"]),
-                str(row["traffic"]),
-            ))
-        con.commit()
-
-
-def fallback_draft(topic, platform, news):
-    context = "; ".join(
-        item["title"] for item in news[:3]
-    )
-
-    if platform == "Instagram Carousel":
-        script = (
-            f"Slide 1: {topic}, apa yang perlu diketahui?\n"
-            "Slide 2: Konteks dan latar belakang\n"
-            "Slide 3: Tiga poin utama\n"
-            "Slide 4: Dampak untuk audiens\n"
-            "Slide 5: Kesimpulan dan pertanyaan"
+    with col2:
+        st.metric(
+            "AI API",
+            "Aktif" if api_key else "Template mode",
         )
+
+    if st.button(
+        "🚀 Ambil tren terbaru",
+        type="primary",
+        use_container_width=True,
+    ):
+        try:
+            with st.spinner("Mengambil dan menganalisis tren..."):
+                raw = fetch_trends(limit=limit)
+                df = analyze_trends(raw)
+                save_trends(df)
+                st.session_state.trends = df
+
+            st.success(f"{len(df)} topik berhasil diproses.")
+
+        except Exception as error:
+            st.error(f"Gagal mengambil tren: {error}")
+
+    df = st.session_state.trends
+
+    if df is not None and not df.empty:
+        st.info(
+            "Skor adalah prioritas relatif dari data saat ini, "
+            "bukan prediksi viral atau jaminan pendapatan."
+        )
+
+        display_columns = [
+            "topic",
+            "traffic",
+            "news_count",
+            "opportunity_score",
+        ]
+
+        st.dataframe(
+            df[display_columns],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.download_button(
+            "⬇️ Download data tren CSV",
+            data=df.to_csv(index=False).encode("utf-8-sig"),
+            file_name="vanya_trends.csv",
+            mime="text/csv",
+        )
+
+        selected_topic = st.selectbox(
+            "Pilih topik untuk dibuatkan konten",
+            options=df["topic"].tolist(),
+        )
+
+        if st.button("Gunakan topik di AI Studio"):
+            st.session_state.selected_topic = selected_topic
+            st.success(
+                "Topik dipilih. Buka tab AI Content Studio."
+            )
+
+
+# =====================================
+# TAB 2: AI CONTENT STUDIO
+# =====================================
+with tab_studio:
+    st.subheader("Buat draft multi-platform")
+
+    trend_df = st.session_state.trends
+
+    if trend_df is not None and not trend_df.empty:
+        trend_options = trend_df["topic"].tolist()
     else:
-        script = (
-            f"HOOK: Lagi ramai soal {topic}. Apa konteksnya?\n\n"
-            "ISI: Jelaskan latar belakang, tiga poin penting, "
-            "dan manfaat praktis bagi audiens.\n\n"
-            "PENUTUP: Rangkum inti pembahasan dan ajak audiens "
-            "berdiskusi."
-        )
+        trend_options = []
 
-    return {
-        "angle": f"Penjelasan praktis tentang {topic}",
-        "hook": f"Lagi ramai soal {topic}. Ini konteksnya.",
-        "script": script,
-        "caption": (
-            f"Yuk pahami {topic} sebelum ikut menyebarkan. "
-            "#Edukasi #Trending"
-        ),
-        "cta": "Apa pendapatmu? Tulis di komentar.",
-        "monetization": (
-            "Pertimbangkan afiliasi, sponsor, atau produk "
-            "relevan hanya jika benar-benar bermanfaat."
-        ),
-        "verification": (
-            "Verifikasi fakta dengan sumber primer. "
-            f"Judul berita terkait: {context or 'belum tersedia'}"
-        ),
-    }
-
-
-def generate_draft(topic, platform, niche, news, api_key, model):
-    if not api_key:
-        return fallback_draft(topic, platform, news)
-
-    from openai import OpenAI
-
-    client = OpenAI(api_key=api_key)
-
-    news_context = "\n".join(
-        f"- {item['title']} | {item['link']}"
-        for item in news
+    default_topic = st.session_state.get(
+        "selected_topic",
+        trend_options[0] if trend_options else "",
     )
 
-    prompt = f"""
-Buat draft konten orisinal berbahasa Indonesia.
+    topic = st.text_input(
+        "Topik",
+        value=default_topic,
+        placeholder="Contoh: perkembangan AI",
+    )
 
-Topik: {topic}
-Niche: {niche}
-Platform: {platform}
-Tujuan: pertumbuhan audiens dan monetisasi jangka panjang.
+    niche = st.text_input(
+        "Niche / target audiens",
+        value="Semua niche trending",
+    )
 
-Judul berita RSS untuk konteks, bukan bukti kebenaran:
-{news_context or "Tidak tersedia"}
+    platforms = st.multiselect(
+        "Platform tujuan",
+        options=PLATFORMS,
+        default=["TikTok", "Instagram Reels", "YouTube Shorts"],
+    )
 
-Aturan:
-- Hook kuat tetapi tidak menyesatkan.
-- Sesuaikan format dengan platform.
-- Jangan mengarang angka, kutipan, atau fakta.
-- Bedakan fakta, opini, dan hal yang perlu diverifikasi.
-- Jangan menjanjikan hasil finansial.
-- Jangan menyalin karya kreator lain.
-- Ide monetisasi harus relevan dan transparan.
-- Jangan menyatakan konten pasti viral.
+    if st.button(
+        "✨ Generate draft",
+        type="primary",
+        use_container_width=True,
+    ):
+        if not topic.strip():
+            st.warning("Masukkan topik terlebih dahulu.")
+        elif not platforms:
+            st.warning("Pilih minimal satu platform.")
+        else:
+            drafts = []
 
-Kembalikan JSON dengan field:
-angle, hook, script, caption, cta, monetization, verification.
-Semua nilai berupa string.
-"""
+            try:
+                with st.spinner("Vanya sedang membuat konten..."):
+                    news = fetch_news(topic.strip())
 
-    response = client.chat.completions.create(
-        model=model,
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "Kamu adalah content strategist dan editor "
-                    "yang kritis, kreatif, serta faktual."
+                    for platform in platforms:
+                        draft = generate_draft(
+                            topic=topic.strip(),
+                            platform=platform,
+                            niche=niche,
+                            news=news,
+                            api_key=api_key,
+                            model=model,
+                        )
+
+                        drafts.append({
+                            "topic": topic.strip(),
+                            "platform": platform,
+                            **draft,
+                        })
+
+                st.session_state.drafts = drafts
+                st.success(f"{len(drafts)} draft berhasil dibuat.")
+
+            except Exception as error:
+                st.error(f"Gagal membuat draft: {error}")
+
+    for index, draft in enumerate(
+        st.session_state.drafts
+    ):
+        with st.expander(
+            f"{draft['platform']} • {draft['topic']}",
+            expanded=(index == 0),
+        ):
+            st.markdown("**Angle**")
+            st.write(draft["angle"])
+
+            st.markdown("**Hook**")
+            st.write(draft["hook"])
+
+            st.markdown("**Script**")
+            st.text_area(
+                "Edit script",
+                value=draft["script"],
+                key=f"script_{index}",
+                height=220,
+            )
+
+            st.markdown("**Caption**")
+            st.text_area(
+                "Edit caption",
+                value=draft["caption"],
+                key=f"caption_{index}",
+                height=120,
+            )
+
+            st.markdown("**CTA**")
+            st.write(draft["cta"])
+
+            st.markdown("**Ide monetisasi**")
+            st.write(draft["monetization"])
+
+            st.warning(
+                "Verifikasi fakta dan hak penggunaan materi sebelum "
+                "publikasi."
+            )
+            st.caption(draft["verification"])
+
+            st.download_button(
+                "Download draft ini",
+                data=json.dumps(
+                    draft,
+                    ensure_ascii=False,
+                    indent=2,
                 ),
-            },
-            {"role": "user", "content": prompt},
-        ],
-        response_format={"type": "json_object"},
-    )
+                file_name=f"vanya_draft_{index + 1}.json",
+                mime="application/json",
+                key=f"download_{index}",
+            )
 
-    content = response.choices[0].message.content
-
-    if not content:
-        raise RuntimeError("AI mengembalikan respons kosong.")
-
-    return json.loads(content)
-
-
-def log_performance(
-    topic, platform, views, likes, comments, shares,
-    followers, revenue, post_url=""
-):
-    init_db()
-
-    with sqlite3.connect(DB_PATH) as con:
-        con.execute("""
-            INSERT INTO performance
-            (recorded_at, topic, platform, views, likes,
-             comments, shares, followers, revenue, post_url)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            timestamp(), topic, platform, views, likes,
-            comments, shares, followers, revenue, post_url,
-        ))
-        con.commit()
-
-
-def get_performance():
-    init_db()
-
-    with sqlite3.connect(DB_PATH) as con:
-        return pd.read_sql_query(
-            "SELECT * FROM performance ORDER BY id DESC",
-            con,
+    if st.session_state.drafts:
+        st.download_button(
+            "⬇️ Download semua draft JSON",
+            data=json.dumps(
+                st.session_state.drafts,
+                ensure_ascii=False,
+                indent=2,
+            ),
+            file_name="vanya_all_drafts.json",
+            mime="application/json",
         )
 
 
-def get_trend_history():
-    init_db()
+# =====================================
+# TAB 3: ANALYTICS
+# =====================================
+with tab_analytics:
+    st.subheader("Pantau performa konten")
 
-    with sqlite3.connect(DB_PATH) as con:
-        return pd.read_sql_query(
-            "SELECT * FROM trend_history ORDER BY id DESC",
-            con,
+    with st.form("performance_form"):
+        p_topic = st.text_input("Topik konten")
+        p_platform = st.selectbox(
+            "Platform",
+            options=PLATFORMS,
+        )
+        p_url = st.text_input("URL posting, opsional")
+
+        c1, c2, c3 = st.columns(3)
+
+        with c1:
+            views = st.number_input(
+                "Views", min_value=0, step=100
+            )
+            likes = st.number_input(
+                "Likes", min_value=0, step=10
+            )
+
+        with c2:
+            comments = st.number_input(
+                "Comments", min_value=0, step=1
+            )
+            shares = st.number_input(
+                "Shares", min_value=0, step=1
+            )
+
+        with c3:
+            followers = st.number_input(
+                "Followers baru", min_value=0, step=1
+            )
+            revenue = st.number_input(
+                "Pendapatan (IDR)",
+                min_value=0.0,
+                step=1000.0,
+            )
+
+        submitted = st.form_submit_button(
+            "Simpan performa",
+            type="primary",
+        )
+
+        if submitted:
+            if not p_topic.strip():
+                st.warning("Topik harus diisi.")
+            else:
+                log_performance(
+                    topic=p_topic.strip(),
+                    platform=p_platform,
+                    views=int(views),
+                    likes=int(likes),
+                    comments=int(comments),
+                    shares=int(shares),
+                    followers=int(followers),
+                    revenue=float(revenue),
+                    post_url=p_url.strip(),
+                )
+                st.success("Performa berhasil disimpan.")
+
+    performance = get_performance()
+
+    if not performance.empty:
+        st.divider()
+
+        total_views = int(performance["views"].sum())
+        total_revenue = float(performance["revenue"].sum())
+        total_followers = int(performance["followers"].sum())
+
+        m1, m2, m3 = st.columns(3)
+
+        m1.metric("Total views", f"{total_views:,}")
+        m2.metric("Total followers", f"{total_followers:,}")
+        m3.metric(
+            "Pendapatan tercatat",
+            f"Rp {total_revenue:,.0f}",
+        )
+
+        performance["engagement_rate"] = (
+            (
+                performance["likes"]
+                + performance["comments"]
+                + performance["shares"]
+            )
+            / performance["views"].replace(0, pd.NA)
+            * 100
+        ).fillna(0).round(2)
+
+        st.dataframe(
+            performance,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.download_button(
+            "⬇️ Download laporan performa CSV",
+            data=performance.to_csv(
+                index=False
+            ).encode("utf-8-sig"),
+            file_name="vanya_performance.csv",
+            mime="text/csv",
+        )
+
+    history = get_trend_history()
+
+    if not history.empty:
+        st.divider()
+        st.subheader("Histori hasil trend hunting")
+        st.dataframe(
+            history.head(100),
+            use_container_width=True,
+            hide_index=True,
         )
