@@ -1,0 +1,295 @@
+
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Vanya Stock Intelligence</title>
+  <style>
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      background: #0b1020;
+      color: #edf2ff;
+      font-family: system-ui, sans-serif;
+    }
+
+    main {
+      max-width: 1050px;
+      margin: auto;
+      padding: 22px;
+    }
+
+    .muted { color: #9eabc4; }
+
+    .card {
+      margin: 18px 0;
+      padding: 18px;
+      background: #131d32;
+      border: 1px solid #293957;
+      border-radius: 14px;
+    }
+
+    input, textarea, button {
+      width: 100%;
+      padding: 11px;
+      margin: 6px 0 12px;
+      border-radius: 8px;
+      font: inherit;
+    }
+
+    input, textarea {
+      color: white;
+      background: #0b1426;
+      border: 1px solid #344562;
+    }
+
+    button {
+      cursor: pointer;
+      color: white;
+      background: #3157a5;
+      border: 0;
+    }
+
+    button:hover { background: #416bc0; }
+
+    pre {
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      overflow-x: auto;
+      padding: 13px;
+      background: #080d17;
+      border-radius: 8px;
+      font-size: 13px;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(
+        auto-fit, minmax(240px, 1fr)
+      );
+      gap: 14px;
+    }
+
+    .status { color: #a6d9ff; }
+  </style>
+</head>
+
+<body>
+<main>
+  <h1>🐍 Vanya Stock Intelligence</h1>
+  <p class="muted">
+    BEI Market Explorer · Data on demand · No database
+  </p>
+
+  <section class="card">
+    <h2>Status sistem</h2>
+    <button onclick="loadStatus()">Periksa koneksi</button>
+    <pre id="status">Belum diperiksa.</pre>
+  </section>
+
+  <section class="card">
+    <h2>🔎 Jelajahi saham</h2>
+    <label for="search">Kode atau nama emiten</label>
+    <input id="search" placeholder="Masukkan kata pencarian">
+
+    <button onclick="searchStocks()">Cari saham</button>
+    <pre id="stocks">Hasil pencarian akan tampil di sini.</pre>
+  </section>
+
+  <section class="card">
+    <h2>📈 Harga saham</h2>
+    <label for="ticker">Kode saham</label>
+    <input id="ticker" placeholder="Kode sesuai provider">
+
+    <div class="grid">
+      <div>
+        <label for="start">Tanggal awal</label>
+        <input id="start" type="date">
+      </div>
+      <div>
+        <label for="end">Tanggal akhir</label>
+        <input id="end" type="date">
+      </div>
+    </div>
+
+    <button onclick="getQuote()">Ambil quote terbaru</button>
+    <button onclick="getHistory()">Ambil histori harian</button>
+    <pre id="prices">Belum ada data yang diminta.</pre>
+  </section>
+
+  <section class="card">
+    <h2>🧠 Diskusi dengan Vanya</h2>
+    <p class="muted">
+      Data yang baru diambil akan dimasukkan otomatis ke kolom
+      data analisis. Vanya hanya boleh menyimpulkan berdasarkan
+      data yang diberikan.
+    </p>
+
+    <label for="question">Apa yang ingin kamu ketahui?</label>
+    <textarea id="question" rows="3"
+      placeholder="Jelaskan tren harga, volume, dan keterbatasan datanya."></textarea>
+
+    <label for="marketData">Data pasar (JSON)</label>
+    <textarea id="marketData" rows="7"
+      placeholder="Ambil quote atau histori terlebih dahulu."></textarea>
+
+    <button onclick="analyze()">Analisis dengan Vanya</button>
+    <pre id="analysis">Belum ada analisis.</pre>
+  </section>
+
+  <p class="muted">
+    Status data dan waktu pengambilan ditampilkan bersama respons.
+    Data kosong bukan berarti harga saham nol.
+  </p>
+</main>
+
+<script>
+  const API = "http://127.0.0.1:8000";
+
+  async function request(path, options = {}) {
+    const response = await fetch(API + path, options);
+    const result = await response.json().catch(() => ({}));
+
+    if (!response.ok) {
+      throw new Error(
+        typeof result.detail === "string"
+          ? result.detail
+          : JSON.stringify(result.detail || result)
+      );
+    }
+
+    return result;
+  }
+
+  function show(id, value) {
+    document.getElementById(id).textContent =
+      JSON.stringify(value, null, 2);
+  }
+
+  function symbol() {
+    return document.getElementById("ticker")
+      .value.trim().toUpperCase();
+  }
+
+  async function loadStatus() {
+    try {
+      show("status", await request("/api/status"));
+    } catch (error) {
+      show("status", { error: error.message });
+    }
+  }
+
+  async function searchStocks() {
+    const q = document.getElementById("search").value.trim();
+
+    try {
+      const result = await request(
+        "/api/instruments?q=" + encodeURIComponent(q)
+      );
+      show("stocks", result);
+    } catch (error) {
+      show("stocks", {
+        error: error.message,
+        hint: "Pastikan adapter penyedia data sudah dikonfigurasi."
+      });
+    }
+  }
+
+  async function getQuote() {
+    if (!symbol()) {
+      show("prices", { error: "Masukkan kode saham." });
+      return;
+    }
+
+    try {
+      const result = await request(
+        "/api/quote/" + encodeURIComponent(symbol())
+      );
+
+      show("prices", result);
+      document.getElementById("marketData").value =
+        JSON.stringify(result, null, 2);
+    } catch (error) {
+      show("prices", { error: error.message });
+    }
+  }
+
+  async function getHistory() {
+    const start = document.getElementById("start").value;
+    const end = document.getElementById("end").value;
+
+    if (!symbol() || !start || !end) {
+      show("prices", {
+        error: "Isi kode saham, tanggal awal, dan tanggal akhir."
+      });
+      return;
+    }
+
+    const params = new URLSearchParams({
+      start,
+      end,
+      interval: "1d"
+    });
+
+    try {
+      const result = await request(
+        "/api/history/" +
+        encodeURIComponent(symbol()) + "?" + params
+      );
+
+      show("prices", result);
+      document.getElementById("marketData").value =
+        JSON.stringify(result, null, 2);
+    } catch (error) {
+      show("prices", { error: error.message });
+    }
+  }
+
+  async function analyze() {
+    const question =
+      document.getElementById("question").value.trim();
+    const rawData =
+      document.getElementById("marketData").value.trim();
+
+    if (!question || !rawData) {
+      show("analysis", {
+        error: "Isi pertanyaan dan ambil data terlebih dahulu."
+      });
+      return;
+    }
+
+    let market_data;
+
+    try {
+      market_data = JSON.parse(rawData);
+    } catch {
+      show("analysis", {
+        error: "Data pasar harus berupa JSON yang valid."
+      });
+      return;
+    }
+
+    try {
+      const result = await request("/api/analyze", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          question,
+          market_data
+        })
+      });
+
+      show("analysis", result);
+    } catch (error) {
+      show("analysis", { error: error.message });
+    }
+  }
+
+  loadStatus();
+</script>
+</body>
+</html>
