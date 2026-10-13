@@ -1,390 +1,298 @@
 
 import os
-import json
-import streamlit as st
-import pandas as pd
+from datetime import datetime, timezone
+from typing import Any
 
-from engine import (
-    PLATFORMS,
-    analyze_trends,
-    fetch_trends,
-    fetch_news,
-    generate_draft,
-    save_trends,
-    log_performance,
-    get_performance,
-    get_trend_history,
+import httpx
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+
+load_dotenv()
+
+app = FastAPI(
+    title="Vanya Stock Intelligence",
+    version="1.0.0",
+    description="BEI market dashboard without a database",
 )
 
-st.set_page_config(
-    page_title="Vanya Content Intelligence",
-    page_icon="🧠",
-    layout="wide",
+# Batasi origin sesuai lokasi frontend kamu.
+origins = [
+    x.strip()
+    for x in os.getenv(
+        "VANYA_CORS_ORIGINS",
+        "http://localhost:5500,http://127.0.0.1:5500"
+    ).split(",")
+    if x.strip()
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=False,
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type"],
 )
 
-st.title("🧠 Vanya Content Intelligence")
-st.caption(
-    "Trend research • AI content studio • Monetization analytics"
-)
+MARKET_URL = os.getenv("MARKET_DATA_BASE_URL", "").rstrip("/")
+MARKET_KEY = os.getenv("MARKET_DATA_API_KEY", "")
 
-# Streamlit Cloud secrets, dengan fallback ke environment variables.
-def get_config(name, default=""):
-    try:
-        value = st.secrets.get(name, default)
-        if value:
-            return str(value)
-    except Exception:
-        pass
-    return os.getenv(name, default)
+AI_URL = os.getenv("AI_API_URL", "").rstrip("/")
+AI_KEY = os.getenv("AI_API_KEY", "")
+AI_MODEL = os.getenv("AI_MODEL", "")
 
 
-api_key = get_config("OPENAI_API_KEY")
-model = get_config("OPENAI_MODEL", "gpt-4.1-mini")
-
-if "trends" not in st.session_state:
-    st.session_state.trends = None
-
-if "drafts" not in st.session_state:
-    st.session_state.drafts = []
-
-tab_trends, tab_studio, tab_analytics = st.tabs([
-    "📡 Trend Hunter",
-    "✍️ AI Content Studio",
-    "📊 Analytics",
-])
-
-# =====================================
-# TAB 1: TREND HUNTER
-# =====================================
-with tab_trends:
-    st.subheader("Cari peluang konten")
-
-    col1, col2 = st.columns([2, 1])
-
-    with col1:
-        limit = st.slider(
-            "Jumlah topik tren",
-            min_value=5,
-            max_value=50,
-            value=25,
-        )
-
-    with col2:
-        st.metric(
-            "AI API",
-            "Aktif" if api_key else "Template mode",
-        )
-
-    if st.button(
-        "🚀 Ambil tren terbaru",
-        type="primary",
-        use_container_width=True,
-    ):
-        try:
-            with st.spinner("Mengambil dan menganalisis tren..."):
-                raw = fetch_trends(limit=limit)
-                df = analyze_trends(raw)
-                save_trends(df)
-                st.session_state.trends = df
-
-            st.success(f"{len(df)} topik berhasil diproses.")
-
-        except Exception as error:
-            st.error(f"Gagal mengambil tren: {error}")
-
-    df = st.session_state.trends
-
-    if df is not None and not df.empty:
-        st.info(
-            "Skor adalah prioritas relatif dari data saat ini, "
-            "bukan prediksi viral atau jaminan pendapatan."
-        )
-
-        display_columns = [
-            "topic",
-            "traffic",
-            "news_count",
-            "opportunity_score",
-        ]
-
-        st.dataframe(
-            df[display_columns],
-            use_container_width=True,
-            hide_index=True,
-        )
-
-        st.download_button(
-            "⬇️ Download data tren CSV",
-            data=df.to_csv(index=False).encode("utf-8-sig"),
-            file_name="vanya_trends.csv",
-            mime="text/csv",
-        )
-
-        selected_topic = st.selectbox(
-            "Pilih topik untuk dibuatkan konten",
-            options=df["topic"].tolist(),
-        )
-
-        if st.button("Gunakan topik di AI Studio"):
-            st.session_state.selected_topic = selected_topic
-            st.success(
-                "Topik dipilih. Buka tab AI Content Studio."
-            )
+def now_utc():
+    return datetime.now(timezone.utc).isoformat()
 
 
-# =====================================
-# TAB 2: AI CONTENT STUDIO
-# =====================================
-with tab_studio:
-    st.subheader("Buat draft multi-platform")
-
-    trend_df = st.session_state.trends
-
-    if trend_df is not None and not trend_df.empty:
-        trend_options = trend_df["topic"].tolist()
-    else:
-        trend_options = []
-
-    default_topic = st.session_state.get(
-        "selected_topic",
-        trend_options[0] if trend_options else "",
-    )
-
-    topic = st.text_input(
-        "Topik",
-        value=default_topic,
-        placeholder="Contoh: perkembangan AI",
-    )
-
-    niche = st.text_input(
-        "Niche / target audiens",
-        value="Semua niche trending",
-    )
-
-    platforms = st.multiselect(
-        "Platform tujuan",
-        options=PLATFORMS,
-        default=["TikTok", "Instagram Reels", "YouTube Shorts"],
-    )
-
-    if st.button(
-        "✨ Generate draft",
-        type="primary",
-        use_container_width=True,
-    ):
-        if not topic.strip():
-            st.warning("Masukkan topik terlebih dahulu.")
-        elif not platforms:
-            st.warning("Pilih minimal satu platform.")
-        else:
-            drafts = []
-
-            try:
-                with st.spinner("Vanya sedang membuat konten..."):
-                    news = fetch_news(topic.strip())
-
-                    for platform in platforms:
-                        draft = generate_draft(
-                            topic=topic.strip(),
-                            platform=platform,
-                            niche=niche,
-                            news=news,
-                            api_key=api_key,
-                            model=model,
-                        )
-
-                        drafts.append({
-                            "topic": topic.strip(),
-                            "platform": platform,
-                            **draft,
-                        })
-
-                st.session_state.drafts = drafts
-                st.success(f"{len(drafts)} draft berhasil dibuat.")
-
-            except Exception as error:
-                st.error(f"Gagal membuat draft: {error}")
-
-    for index, draft in enumerate(
-        st.session_state.drafts
-    ):
-        with st.expander(
-            f"{draft['platform']} • {draft['topic']}",
-            expanded=(index == 0),
-        ):
-            st.markdown("**Angle**")
-            st.write(draft["angle"])
-
-            st.markdown("**Hook**")
-            st.write(draft["hook"])
-
-            st.markdown("**Script**")
-            st.text_area(
-                "Edit script",
-                value=draft["script"],
-                key=f"script_{index}",
-                height=220,
-            )
-
-            st.markdown("**Caption**")
-            st.text_area(
-                "Edit caption",
-                value=draft["caption"],
-                key=f"caption_{index}",
-                height=120,
-            )
-
-            st.markdown("**CTA**")
-            st.write(draft["cta"])
-
-            st.markdown("**Ide monetisasi**")
-            st.write(draft["monetization"])
-
-            st.warning(
-                "Verifikasi fakta dan hak penggunaan materi sebelum "
-                "publikasi."
-            )
-            st.caption(draft["verification"])
-
-            st.download_button(
-                "Download draft ini",
-                data=json.dumps(
-                    draft,
-                    ensure_ascii=False,
-                    indent=2,
+def require_market_provider():
+    if not MARKET_URL:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "provider_not_configured",
+                "message": (
+                    "Sumber data saham belum dikonfigurasi. "
+                    "Hubungkan penyedia data yang sah terlebih dahulu."
                 ),
-                file_name=f"vanya_draft_{index + 1}.json",
-                mime="application/json",
-                key=f"download_{index}",
-            )
-
-    if st.session_state.drafts:
-        st.download_button(
-            "⬇️ Download semua draft JSON",
-            data=json.dumps(
-                st.session_state.drafts,
-                ensure_ascii=False,
-                indent=2,
-            ),
-            file_name="vanya_all_drafts.json",
-            mime="application/json",
+            },
         )
 
 
-# =====================================
-# TAB 3: ANALYTICS
-# =====================================
-with tab_analytics:
-    st.subheader("Pantau performa konten")
+async def market_get(path: str, params: dict | None = None) -> Any:
+    """Mengambil data langsung dari provider, tanpa menyimpannya."""
+    require_market_provider()
 
-    with st.form("performance_form"):
-        p_topic = st.text_input("Topik konten")
-        p_platform = st.selectbox(
-            "Platform",
-            options=PLATFORMS,
+    headers = {"Accept": "application/json"}
+    if MARKET_KEY:
+        headers["Authorization"] = f"Bearer {MARKET_KEY}"
+
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            response = await client.get(
+                f"{MARKET_URL}/{path.lstrip('/')}",
+                headers=headers,
+                params=params,
+            )
+            response.raise_for_status()
+            return response.json()
+
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Provider data gagal: HTTP {exc.response.status_code}",
         )
-        p_url = st.text_input("URL posting, opsional")
-
-        c1, c2, c3 = st.columns(3)
-
-        with c1:
-            views = st.number_input(
-                "Views", min_value=0, step=100
-            )
-            likes = st.number_input(
-                "Likes", min_value=0, step=10
-            )
-
-        with c2:
-            comments = st.number_input(
-                "Comments", min_value=0, step=1
-            )
-            shares = st.number_input(
-                "Shares", min_value=0, step=1
-            )
-
-        with c3:
-            followers = st.number_input(
-                "Followers baru", min_value=0, step=1
-            )
-            revenue = st.number_input(
-                "Pendapatan (IDR)",
-                min_value=0.0,
-                step=1000.0,
-            )
-
-        submitted = st.form_submit_button(
-            "Simpan performa",
-            type="primary",
+    except httpx.RequestError:
+        raise HTTPException(
+            status_code=502,
+            detail="Provider data tidak dapat dihubungi.",
+        )
+    except ValueError:
+        raise HTTPException(
+            status_code=502,
+            detail="Provider tidak mengembalikan JSON yang valid.",
         )
 
-        if submitted:
-            if not p_topic.strip():
-                st.warning("Topik harus diisi.")
-            else:
-                log_performance(
-                    topic=p_topic.strip(),
-                    platform=p_platform,
-                    views=int(views),
-                    likes=int(likes),
-                    comments=int(comments),
-                    shares=int(shares),
-                    followers=int(followers),
-                    revenue=float(revenue),
-                    post_url=p_url.strip(),
-                )
-                st.success("Performa berhasil disimpan.")
 
-    performance = get_performance()
+@app.get("/")
+def home():
+    return {
+        "app": "Vanya Stock Intelligence",
+        "status": "running",
+        "database": False,
+        "market_provider_configured": bool(MARKET_URL),
+        "ai_configured": bool(AI_URL and AI_KEY and AI_MODEL),
+        "timestamp_utc": now_utc(),
+    }
 
-    if not performance.empty:
-        st.divider()
 
-        total_views = int(performance["views"].sum())
-        total_revenue = float(performance["revenue"].sum())
-        total_followers = int(performance["followers"].sum())
+@app.get("/api/status")
+def status():
+    return {
+        "database": "disabled",
+        "market_data": (
+            "provider_configured" if MARKET_URL
+            else "not_configured"
+        ),
+        "ai": (
+            "configured" if AI_URL and AI_KEY and AI_MODEL
+            else "not_configured"
+        ),
+        "checked_at_utc": now_utc(),
+        "warning": (
+            "Konfigurasi provider tidak otomatis berarti "
+            "akses real-time sudah tersedia."
+        ),
+    }
 
-        m1, m2, m3 = st.columns(3)
 
-        m1.metric("Total views", f"{total_views:,}")
-        m2.metric("Total followers", f"{total_followers:,}")
-        m3.metric(
-            "Pendapatan tercatat",
-            f"Rp {total_revenue:,.0f}",
+@app.get("/api/instruments")
+async def instruments(
+    q: str = "",
+    limit: int = Query(100, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+):
+    # Kontrak adapter Vanya, bukan endpoint resmi BEI.
+    data = await market_get(
+        "instruments",
+        {"q": q, "limit": limit, "offset": offset},
+    )
+
+    return {
+        "data": data,
+        "source": "configured_provider",
+        "retrieved_at_utc": now_utc(),
+    }
+
+
+@app.get("/api/quote/{ticker}")
+async def quote(ticker: str):
+    symbol = ticker.strip().upper()
+
+    if not symbol:
+        raise HTTPException(400, "Kode saham wajib diisi.")
+
+    data = await market_get(f"quote/{symbol}")
+
+    return {
+        "ticker": symbol,
+        "data": data,
+        "source": "configured_provider",
+        "retrieved_at_utc": now_utc(),
+        "note": (
+            "Gunakan timestamp dan metadata provider untuk "
+            "memastikan apakah data real-time atau tertunda."
+        ),
+    }
+
+
+@app.get("/api/history/{ticker}")
+async def history(
+    ticker: str,
+    start: str,
+    end: str,
+    interval: str = Query(
+        "1d",
+        pattern="^(1d|1m|5m|15m|30m|1h)$",
+    ),
+):
+    # Validasi tanggal sebelum mengirim permintaan.
+    try:
+        start_date = datetime.strptime(start, "%Y-%m-%d").date()
+        end_date = datetime.strptime(end, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(
+            422, "Tanggal harus menggunakan format YYYY-MM-DD."
         )
 
-        performance["engagement_rate"] = (
-            (
-                performance["likes"]
-                + performance["comments"]
-                + performance["shares"]
+    if start_date > end_date:
+        raise HTTPException(
+            422, "Tanggal awal tidak boleh setelah tanggal akhir."
+        )
+
+    symbol = ticker.strip().upper()
+
+    data = await market_get(
+        f"history/{symbol}",
+        {
+            "start": start,
+            "end": end,
+            "interval": interval,
+        },
+    )
+
+    return {
+        "ticker": symbol,
+        "data": data,
+        "source": "configured_provider",
+        "retrieved_at_utc": now_utc(),
+        "interval": interval,
+    }
+
+
+class AnalyzeRequest(BaseModel):
+    question: str = Field(min_length=1, max_length=3000)
+    market_data: dict[str, Any]
+
+
+@app.post("/api/analyze")
+async def analyze(req: AnalyzeRequest):
+    if not (AI_URL and AI_KEY and AI_MODEL):
+        raise HTTPException(
+            503,
+            "AI belum dikonfigurasi. Periksa variabel AI_API_URL, "
+            "AI_API_KEY, dan AI_MODEL.",
+        )
+
+    system_prompt = """
+Kamu adalah Vanya Stock Intelligence, asisten riset saham Indonesia.
+
+ATURAN:
+1. Gunakan hanya data yang diberikan pengguna.
+2. Jangan pernah mengarang harga, volume, tanggal, berita,
+   laporan keuangan, atau sumber.
+3. Pisahkan fakta teramati, hasil perhitungan, dan interpretasi.
+4. Jika data tidak lengkap atau kedaluwarsa, katakan dengan jelas.
+5. Jangan menjanjikan keuntungan atau menyebut prediksi sebagai fakta.
+6. Cantumkan keterbatasan analisis dan timestamp jika tersedia.
+7. Jawab dalam bahasa Indonesia yang jelas dan terstruktur.
+"""
+
+    payload = {
+        "model": AI_MODEL,
+        "temperature": 0.2,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": (
+                    f"Pertanyaan: {req.question}\n\n"
+                    "Data pasar yang tersedia:\n"
+                    f"{req.model_dump()['market_data']}"
+                ),
+            },
+        ],
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            response = await client.post(
+                AI_URL,
+                headers={
+                    "Authorization": f"Bearer {AI_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
             )
-            / performance["views"].replace(0, pd.NA)
-            * 100
-        ).fillna(0).round(2)
+            response.raise_for_status()
+            result = response.json()
 
-        st.dataframe(
-            performance,
-            use_container_width=True,
-            hide_index=True,
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(
+            502,
+            f"Provider AI gagal: HTTP {exc.response.status_code}",
+        )
+    except httpx.RequestError:
+        raise HTTPException(502, "Provider AI tidak dapat dihubungi.")
+    except ValueError:
+        raise HTTPException(502, "Respons AI bukan JSON yang valid.")
+
+    try:
+        answer = result["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        raise HTTPException(
+            502,
+            "Format respons AI tidak sesuai dengan API kompatibel OpenAI.",
         )
 
-        st.download_button(
-            "⬇️ Download laporan performa CSV",
-            data=performance.to_csv(
-                index=False
-            ).encode("utf-8-sig"),
-            file_name="vanya_performance.csv",
-            mime="text/csv",
-        )
-
-    history = get_trend_history()
-
-    if not history.empty:
-        st.divider()
-        st.subheader("Histori hasil trend hunting")
-        st.dataframe(
-            history.head(100),
-            use_container_width=True,
-            hide_index=True,
-        )
+    return {
+        "answer": answer,
+        "generated_at_utc": now_utc(),
+        "data_persistence": "disabled",
+        "disclaimer": (
+            "Analisis berdasarkan data yang diberikan, bukan jaminan "
+            "hasil investasi."
+        ),
+    }
